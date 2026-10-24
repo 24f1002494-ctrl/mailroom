@@ -1,0 +1,15 @@
+{
+  "name": "mailroom-action-gate",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Mailroom agent: AI decides, code validates, signed receipts gate every effect.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node test/run.js && TEST_BACKEND=redis node test/run.js && node test/vercel.js"
+  },
+  "dependencies": {
+    "@vercel/functions": "^2.0.0"
+  },
+  "engines": { "node": ">=20" }
+}
