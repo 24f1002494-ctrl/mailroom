@@ -146,8 +146,10 @@ function verifyReceiptSignature(verifier, commitBody, r) {
     const { receiptSignature, ...inner } = r;
     const message = canon({ profile: PROFILE, evaluationId: commitBody.evaluationId, inputDigest: commitBody.inputDigest, receipt: inner });
     const key = crypto.createPublicKey({ key: verifier, format: 'jwk' });
+    // strict standard base64 only: Node's decoder silently skips junk characters, which would let a mangled signature verify
+    if (typeof receiptSignature !== 'string' || !/^[A-Za-z0-9+/]{86}==$/.test(receiptSignature)) return false;
     const sig = Buffer.from(receiptSignature, 'base64');
-    if (sig.length !== 64) return false;
+    if (sig.length !== 64 || sig.toString('base64') !== receiptSignature) return false;
     return crypto.verify(null, Buffer.from(message, 'utf8'), key, sig);
   } catch {
     return false;
@@ -161,12 +163,8 @@ async function commit(body, reqHash) {
     const rec = await store.get('evals', evalId);
     if (!rec) throw new HttpError(404, 'unknown_evaluation', 'unknown evaluationId');
     if (body.inputDigest !== rec.inputDigest) throw new HttpError(409, 'digest_mismatch', 'inputDigest does not match this evaluation');
-    if (rec.commit) {
-      if (rec.commit.reqHash !== reqHash) throw new HttpError(409, 'commit_conflict', 'evaluation already committed with different receipts');
-      return rec.commit.responseText; // exact replay: nothing is executed twice
-    }
 
-    // 1. structure: exactly one receipt per proposal, none duplicated, all matching the persisted proposal
+    // 1. bindings: exactly one receipt per proposal, none duplicated, all matching the persisted proposal
     const byCall = new Map(rec.proposals.map((p) => [p.callId, p]));
     const seenCall = new Set(); const seenDossier = new Set(); const seenReceipt = new Set();
     if (body.receipts.length !== rec.proposals.length) throw new HttpError(422, 'receipt_count', 'exactly one receipt per proposal is required');
@@ -174,17 +172,23 @@ async function commit(body, reqHash) {
       if (seenCall.has(r.callId) || seenDossier.has(r.dossierId) || seenReceipt.has(r.receiptId)) throw new HttpError(422, 'duplicate_receipt', 'duplicate receipt');
       seenCall.add(r.callId); seenDossier.add(r.dossierId); seenReceipt.add(r.receiptId);
       const p = byCall.get(r.callId);
-      if (!p) throw new HttpError(409, 'unknown_call', 'receipt callId does not match any persisted proposal');
+      if (!p) throw new HttpError(422, 'unknown_call', 'receipt callId does not match any persisted proposal');
       if (p.dossierId !== r.dossierId || p.action !== r.action || p.proposalDigest !== r.proposalDigest) {
-        throw new HttpError(409, 'proposal_mismatch', 'receipt does not match the persisted proposal');
+        throw new HttpError(422, 'proposal_mismatch', 'receipt does not match the persisted proposal');
       }
     }
-    // 2. signatures: every one must verify against THIS evaluation's key, or nothing is recorded
+    // 2. signatures: every one must verify against THIS evaluation's key. This runs even for an
+    //    already-committed evaluation, so a bad receipt is always rejected, never replayed or accepted.
     for (const r of body.receipts) {
       if (!verifyReceiptSignature(rec.verifier, body, r)) throw new HttpError(422, 'invalid_receipt_signature', 'a receipt signature is invalid');
     }
+    // 3. all receipts are valid; an identical request replays the stored result, a different valid set conflicts
+    if (rec.commit) {
+      if (rec.commit.reqHash !== reqHash) throw new HttpError(409, 'commit_conflict', 'evaluation already committed with different receipts');
+      return rec.commit.responseText; // exact replay: nothing is executed twice
+    }
 
-    // 3. record effects (obey `accepted` exactly), then persist, then reply
+    // 4. record effects (obey `accepted` exactly), then persist, then reply
     const byCallReceipt = new Map(body.receipts.map((r) => [r.callId, r]));
     const outcomes = rec.proposals.map((p) => {
       const r = byCallReceipt.get(p.callId);
@@ -235,8 +239,27 @@ function readBody(req) {
   });
 }
 
+let lastSelfTest = { at: 0, result: null };
+async function selfTest() {
+  // GET /?selftest=1 : one tiny model call, throttled; reports why the model path fails (no secrets)
+  if (Date.now() - lastSelfTest.at < 20000 && lastSelfTest.result) return lastSelfTest.result;
+  const base = process.env.LLM_BASE_URL || '(default for provider)';
+  const info = { provider: llm.PROVIDER, model: llm.MODEL, baseUrl: base.replace(/^(https?:\/\/[^/]+).*/, '$1'), hasApiKey: !!process.env.LLM_API_KEY, store: store ? store.kind : 'unavailable' };
+  const t0 = Date.now();
+  try {
+    const text = await llm.complete({ system: 'Reply with the JSON object {"ok":true} and nothing else.', user: 'ping (respond in json)', maxTokens: 30 });
+    info.modelOk = true; info.sample = String(text).slice(0, 80);
+  } catch (e) {
+    info.modelOk = false; info.error = String(e.message || e).slice(0, 300).replace(/(key|token|bearer)[^\s"]*/gi, '$1***');
+  }
+  info.ms = Date.now() - t0;
+  lastSelfTest = { at: Date.now(), result: info };
+  return info;
+}
+
 async function handle(req, res) {
   try {
+    if (req.method === 'GET' && /selftest/.test(req.url || '')) return send(res, 200, JSON.stringify(await selfTest()));
     if (req.method === 'GET' || req.method === 'HEAD') {
       return send(res, 200, JSON.stringify({ ok: !storeError, service: 'mailroom-action-gate', profile: PROFILE, store: store ? store.kind : 'unavailable' }));
     }
