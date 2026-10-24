@@ -105,7 +105,7 @@ function startService(port) {
     const redisEnv = BACKEND === 'redis'
       ? { UPSTASH_REDIS_REST_URL: `http://127.0.0.1:${fakeRedis.address().port}`, UPSTASH_REDIS_REST_TOKEN: 'redis-test-token' }
       : { UPSTASH_REDIS_REST_URL: '', UPSTASH_REDIS_REST_TOKEN: '', KV_REST_API_URL: '', KV_REST_API_TOKEN: '' };
-    child = spawn('node', [path.join(__dirname, '..', 'src', 'server.js')], {
+    child = spawn('node', [path.join(__dirname, '..', 'src', 'core.js')], {
       env: { ...process.env, ...redisEnv, PORT: String(port), DATA_DIR: dataDir, LLM_PROVIDER: 'openai', LLM_BASE_URL: `http://127.0.0.1:${fake.address().port}/v1`, LLM_API_KEY: 'test', LLM_MODEL: 'fake', LLM_RETRIES: '0' },
       stdio: ['ignore', 'pipe', 'inherit'],
     });

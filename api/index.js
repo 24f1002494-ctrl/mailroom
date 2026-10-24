@@ -5,7 +5,7 @@
 let handle = null;
 let bootError = null;
 try {
-  ({ handle } = require('../src/server'));
+  ({ handle } = require('../src/core'));
 } catch (e) {
   bootError = e;
   console.error('boot failed:', (e && e.stack) || e);

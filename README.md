@@ -23,7 +23,7 @@ export LLM_PROVIDER=openai        # openai (any OpenAI-compatible API) | anthrop
 export LLM_BASE_URL=https://api.openai.com/v1
 export LLM_MODEL=gpt-4o-mini
 export DATA_DIR=./data
-node src/server.js                # listens on $PORT (default 8080)
+node src/core.js                # listens on $PORT (default 8080)
 ```
 
 Other providers: Gemini `LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai`,
