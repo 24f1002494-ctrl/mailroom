@@ -50,6 +50,7 @@ class FileStore {
   }
 
   async put(kind, key, obj) {
+    fs.mkdirSync(path.join(this.dir, kind), { recursive: true });
     const file = this._file(kind, key);
     const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
     const fd = fs.openSync(tmp, 'w');
@@ -73,6 +74,20 @@ class FileStore {
   }
 
   lock(key, fn) { return this.local.run(key, fn); }
+
+  async listPush(name, val, cap = 400) {
+    const f = path.join(this.dir, `list-${name}.jsonl`);
+    fs.appendFileSync(f, JSON.stringify(val) + '\n');
+  }
+
+  async listRange(name, n = 400) {
+    try {
+      return fs.readFileSync(path.join(this.dir, `list-${name}.jsonl`), 'utf8').split('\n').filter(Boolean).slice(-n).map((l) => JSON.parse(l));
+    } catch (e) {
+      if (e.code === 'ENOENT') return [];
+      throw e;
+    }
+  }
 }
 
 class RedisStore {
@@ -124,6 +139,17 @@ class RedisStore {
 
   async appendLedger(line) {
     await this.cmd(['RPUSH', `${this.prefix}:ledger`, JSON.stringify(line)]);
+  }
+
+  async listPush(name, val, cap = 400) {
+    const k = `${this.prefix}:list:${name}`;
+    await this.cmd(['RPUSH', k, JSON.stringify(val)]);
+    await this.cmd(['LTRIM', k, String(-cap), '-1']);
+  }
+
+  async listRange(name, n = 400) {
+    const r = await this.cmd(['LRANGE', `${this.prefix}:list:${name}`, String(-n), '-1']);
+    return (r || []).map((x) => JSON.parse(x));
   }
 
   // distributed lock (SET NX PX + compare-and-delete) so concurrent serverless instances serialise per evaluation

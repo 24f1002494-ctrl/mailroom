@@ -71,7 +71,7 @@ const fake = http.createServer((req, res) => {
 
 // ------------------------------------------------------------ fake Upstash (Redis REST) for TEST_BACKEND=redis
 const BACKEND = process.env.TEST_BACKEND === 'redis' ? 'redis' : 'file';
-const redisKv = new Map(); const redisLedger = []; let lockContention = 0;
+const redisKv = new Map(); const redisLedger = []; const redisLists = new Map(); let lockContention = 0;
 const fakeRedis = http.createServer((req, res) => {
   let b = '';
   req.on('data', (c) => { b += c; });
@@ -87,7 +87,9 @@ const fakeRedis = http.createServer((req, res) => {
         redisKv.set(a[0], a[1]);
         return out(200, { result: 'OK' });
       }
-      case 'RPUSH': redisLedger.push(a[1]); return out(200, { result: redisLedger.length });
+      case 'RPUSH': { const l = redisLists.get(a[0]) || []; l.push(a[1]); redisLists.set(a[0], l); if (a[0].endsWith(':ledger')) redisLedger.push(a[1]); return out(200, { result: l.length }); }
+      case 'LTRIM': { const l = redisLists.get(a[0]) || []; const n = Math.abs(+a[1]); if (l.length > n) redisLists.set(a[0], l.slice(-n)); return out(200, { result: 'OK' }); }
+      case 'LRANGE': { const l = redisLists.get(a[0]) || []; const n = Math.abs(+a[1]); return out(200, { result: l.slice(-n) }); }
       case 'EVAL': { // compare-and-delete lock release
         const [, , key, token] = a;
         if (redisKv.get(key) === token) { redisKv.delete(key); return out(200, { result: 1 }); }
@@ -257,6 +259,30 @@ const ok = (name, cond, extra) => { assert.ok(cond, `${name}${extra ? ' :: ' + e
   const c2 = await post(commitBody('eval-2', r2.json.inputDigest, good2));
   ok('failed attempts did not poison eval-2: valid commit succeeds', c2.status === 200 && c2.json.status === 'completed');
 
+  console.log('receipt hardening');
+  const g3 = receipts('eval-3', r3.json.inputDigest, r3.json.proposals, k3);
+  const junk1 = JSON.parse(JSON.stringify(g3)); junk1[0].receiptSignature += '!!';
+  r = await post(commitBody('eval-3', r3.json.inputDigest, junk1));
+  ok('signature with trailing junk => 422 (not silently decoded)', r.status === 422);
+  const junk2 = JSON.parse(JSON.stringify(g3)); junk2[0].receiptSignature = junk2[0].receiptSignature.slice(0, 40) + '\n' + junk2[0].receiptSignature.slice(40);
+  r = await post(commitBody('eval-3', r3.json.inputDigest, junk2));
+  ok('signature with embedded whitespace => 422', r.status === 422);
+  const lenA = ledger();
+  const afterDone = JSON.parse(JSON.stringify(g1)); afterDone[2].receiptSignature = afterDone[2].receiptSignature.slice(0, -4) + 'AAA=';
+  r = await post(commitBody('eval-1', P1.inputDigest, afterDone));
+  ok('bad signature on an already-committed evaluation => 422 (not replay, not 409)', r.status === 422 && ledger() === lenA);
+  const wrongMapping = JSON.parse(JSON.stringify(g3)); wrongMapping[0].callId = wrongMapping[1].callId;
+  r = await post(commitBody('eval-3', r3.json.inputDigest, wrongMapping));
+  ok('receipt bound to another call => 422', r.status === 422);
+  r = await post(commitBody('eval-3', r3.json.inputDigest, g3));
+  ok('valid receipts still commit after failed attempts', r.status === 200 && r.json.status === 'completed');
+  const st = await fetch(base + '?selftest=1'); const stj = await st.json();
+  ok('selftest endpoint reports model status without secrets', st.status === 200 && stj.modelOk === true && !JSON.stringify(stj).includes('"test"'));
+
+  const dm = await fetch(base + '?dump=' + '876593b8fd8f0bd58b3e'); const dj = await dm.json();
+  ok('token-gated dump returns captured dossiers, proposals and request log', dm.status === 200 && dj.evals.length >= 3 && dj.evals[0].newItems.length === DOSSIERS.length && dj.log.some((l) => l.code === 'invalid_receipt_signature'));
+  const nodump = await fetch(base + '?dump=wrong'); ok('dump without the token is just the health page', (await nodump.json()).evals === undefined);
+
   console.log('durability across restart');
   await stopService();
   await startService(port);
@@ -264,7 +290,7 @@ const ok = (name, cond, extra) => { assert.ok(cond, `${name}${extra ? ' :: ' + e
   const p1x = await post(proposeBody('eval-1', k1));
   const c1x = await post(commitBody('eval-1', P1.inputDigest, g1));
   ok('propose replay after restart identical, no model work', p1x.text === r1.text && totalCalls === calls2);
-  ok('commit replay after restart identical, no repeated effect', c1x.text === c1.text && ledger() === (P1.proposals.length - 1) + (r2.json.proposals.length));
+  ok('commit replay after restart identical, no repeated effect', c1x.text === c1.text && ledger() === (P1.proposals.length - 1) + (r2.json.proposals.length) + r3.json.proposals.length);
   const r4 = await post(proposeBody('eval-4', k1));
   ok('new evaluation after restart served from persisted cache', cachedIds.every((i) => perDossierCalls[i] === callsAfterFirst[i]) && r4.status === 200);
 

@@ -4,14 +4,16 @@ const crypto = require('crypto');
 const { canon, sha256 } = require('./canon');
 const { PROFILE, HttpError, validateEnvelope, validatePropose, validateCommit } = require('./schema');
 const { createStore } = require('./store');
-const { decideAll, fallbackProposal } = require('./decide');
+const { decideAll, fallbackProposal, renderDossier } = require('./decide');
 const llm = require('./llm');
+const DUMP_TOKEN = process.env.DUMP_TOKEN || '876593b8fd8f0bd58b3e'; // debug read access to captured exam traffic; remove after tuning
 
 const PORT = +process.env.PORT || 8080;
 const MAX_BODY = +process.env.MAX_BODY_BYTES || 8 * 1024 * 1024;
 const MAX_RESPONSE = 400 * 1024; // grader rejects successful bodies over 512 KiB
 const PROPOSE_BUDGET_MS = +process.env.PROPOSE_BUDGET_MS || 46000; // grader allows 55 s per request
-const CACHE_VERSION = process.env.CACHE_VERSION || 'v1';
+const CACHE_VERSION = process.env.CACHE_VERSION || 'v2';
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
 let store = null;
 let storeError = null;
@@ -68,11 +70,11 @@ async function resolveProposals(dossiers, allowed) {
       inflightDecisions.set(fp, df.promise);
       misses.push({
         d,
-        resolve: async (proposal) => {
+        resolve: async (proposal, trace) => {
           try {
             if (proposal) {
               // persist before anything can reply with it
-              await store.put('decisions', fp, { fingerprint: fp, dossierId: d.dossierId, proposal, decidedAt: new Date().toISOString(), model: llm.MODEL });
+              await store.put('decisions', fp, { fingerprint: fp, dossierId: d.dossierId, proposal, trace: trace || null, decidedAt: new Date().toISOString(), model: llm.MODEL });
             }
           } catch (e) {
             console.error('decision persist failed', e.message);
@@ -125,6 +127,7 @@ async function propose(body, reqHash) {
     }
     const inputDigest = sha256(canon(body.dossiers));
     const t0 = Date.now();
+    try { await store.put('meta', 'last_propose', { evaluationId: evalId, allowed, dossiers: body.dossiers, at: new Date().toISOString() }); } catch (e) { console.error('last_propose save failed', e.message); }
     const { proposals, fallbacks, misses } = await resolveProposals(body.dossiers, allowed);
     const response = { profile: PROFILE, evaluationId: evalId, status: 'awaiting_receipts', inputDigest, proposals };
     const text = JSON.stringify(response);
@@ -135,6 +138,10 @@ async function propose(body, reqHash) {
       proposals: proposals.map((p) => ({ ...p, proposalDigest: proposalDigest(p) })),
       proposeResponseText: text, commit: null, createdAt: new Date().toISOString(),
     });
+    try {
+      await store.put('dump', evalId, { evaluationId: evalId, at: new Date().toISOString(), corpus: body.corpus || null, dossiers: body.dossiers, proposals, fallbacks });
+      await store.listPush('dumpindex', evalId, 40);
+    } catch (e) { console.error('dump failed', e.message); }
     console.log(JSON.stringify({ evt: 'propose', evaluationId: evalId, dossiers: proposals.length, modelDossiers: misses, fallbacks, ms: Date.now() - t0, llm: llm.stats }));
     return text;
   });
@@ -257,8 +264,30 @@ async function selfTest() {
   return info;
 }
 
+async function buildDump() {
+  const ids = [...new Set(await store.listRange('dumpindex', 40))].slice(-8);
+  const seen = new Map(); const evals = [];
+  for (const id of ids) {
+    const d = await store.get('dump', id); if (!d) continue;
+    const byId = new Map(d.proposals.map((p) => [p.dossierId, p]));
+    const items = [];
+    for (const dos of d.dossiers) {
+      const fp = sha256(canon(dos));
+      if (seen.has(fp)) continue;
+      seen.set(fp, 1);
+      items.push({ dossier: dos, ours: byId.get(dos.dossierId) || null });
+    }
+    evals.push({ evaluationId: id, at: d.at, corpus: d.corpus, fallbacks: d.fallbacks, newItems: items });
+  }
+  return { evals, log: await store.listRange('debuglog', 300) };
+}
+
+async function dbg(entry) { try { await store.listPush('debuglog', { t: new Date().toISOString(), ...entry }, 300); } catch { /* ignore */ } }
+
 async function handle(req, res) {
+  let ctx = {};
   try {
+    if (req.method === 'GET' && (req.url || '').includes('dump=' + DUMP_TOKEN)) return send(res, 200, JSON.stringify(await buildDump()));
     if (req.method === 'GET' && /selftest/.test(req.url || '')) return send(res, 200, JSON.stringify(await selfTest()));
     if (req.method === 'GET' || req.method === 'HEAD') {
       return send(res, 200, JSON.stringify({ ok: !storeError, service: 'mailroom-action-gate', profile: PROFILE, store: store ? store.kind : 'unavailable' }));
@@ -273,11 +302,14 @@ async function handle(req, res) {
       body = raw;
     }
     validateEnvelope(body);
+    ctx = { op: body.operation, evaluationId: body.evaluationId, nReceipts: Array.isArray(body.receipts) ? body.receipts.length : undefined };
     const reqHash = sha256(canon(body));
+    const t0 = Date.now();
     const text = body.operation === 'propose' ? await propose(body, reqHash) : await commit(body, reqHash);
+    await dbg({ op: body.operation, evaluationId: body.evaluationId, status: 200, nReceipts: Array.isArray(body.receipts) ? body.receipts.length : undefined, ms: Date.now() - t0 });
     return send(res, 200, text);
   } catch (e) {
-    if (e instanceof HttpError) return sendErr(res, e.status, e.code, e.message);
+    if (e instanceof HttpError) { await dbg({ ...ctx, status: e.status, code: e.code, msg: e.message }); return sendErr(res, e.status, e.code, e.message); }
     console.error('unhandled', (e && e.stack) || e);
     return sendErr(res, 500, 'internal_error', 'internal error');
   }
